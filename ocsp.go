@@ -89,9 +89,10 @@ type ocspRequest struct {
 }
 
 type tbsRequest struct {
-	Version       int              `asn1:"explicit,tag:0,default:0,optional"`
-	RequestorName pkix.RDNSequence `asn1:"explicit,tag:1,optional"`
-	RequestList   []request
+	Version           int              `asn1:"explicit,tag:0,default:0,optional"`
+	RequestorName     pkix.RDNSequence `asn1:"explicit,tag:1,optional"`
+	RequestList       []request
+	RequestExtensions []pkix.Extension `asn1:"explicit,tag:2,optional"`
 }
 
 type request struct {
@@ -116,11 +117,12 @@ type basicResponse struct {
 }
 
 type responseData struct {
-	Raw            asn1.RawContent
-	Version        int `asn1:"optional,default:0,explicit,tag:0"`
-	RawResponderID asn1.RawValue
-	ProducedAt     time.Time `asn1:"generalized"`
-	Responses      []singleResponse
+	Raw                asn1.RawContent
+	Version            int `asn1:"optional,default:0,explicit,tag:0"`
+	RawResponderID     asn1.RawValue
+	ProducedAt         time.Time `asn1:"generalized"`
+	Responses          []singleResponse
+	ResponseExtensions []pkix.Extension `asn1:"explicit,tag:1,optional"`
 }
 
 type singleResponse struct {
@@ -314,6 +316,7 @@ type Request struct {
 	IssuerNameHash []byte
 	IssuerKeyHash  []byte
 	SerialNumber   *big.Int
+	Extensions     []pkix.Extension
 }
 
 // Marshal marshals the OCSP request to ASN.1 DER encoded form.
@@ -338,6 +341,7 @@ func (req *Request) Marshal() ([]byte, error) {
 					},
 				},
 			},
+			RequestExtensions: req.Extensions,
 		},
 	})
 }
@@ -386,6 +390,10 @@ type Response struct {
 	// ExtraExtensions field is not populated when parsing certificates, see
 	// Extensions.
 	ExtraExtensions []pkix.Extension
+
+	// ResponseExtensions contains any other additional extensions
+	// from the OCSP response (in the responseExtensions field).
+	ResponseExtensions []pkix.Extension
 }
 
 // These are pre-serialized error responses for the various non-success codes
@@ -420,23 +428,31 @@ func (p ParseError) Error() string {
 // requests for a single certificate. Signed requests are not supported.
 // If a request includes a signature, it will result in a ParseError.
 func ParseRequest(bytes []byte) (*Request, error) {
+	req, _, err := ParseRequestWithExtensions(bytes)
+
+	return req, err
+}
+
+// ParseRequestWithExtensions acts identically to ParseRequest, except it supports
+// parsing requests that contain additional extensions.
+func ParseRequestWithExtensions(bytes []byte) (*Request, []pkix.Extension, error) {
 	var req ocspRequest
 	rest, err := asn1.Unmarshal(bytes, &req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(rest) > 0 {
-		return nil, ParseError("trailing data in OCSP request")
+		return nil, nil, ParseError("trailing data in OCSP request")
 	}
 
 	if len(req.TBSRequest.RequestList) == 0 {
-		return nil, ParseError("OCSP request contains no request body")
+		return nil, nil, ParseError("OCSP request contains no request body")
 	}
 	innerRequest := req.TBSRequest.RequestList[0]
 
 	hashFunc := getHashAlgorithmFromOID(innerRequest.Cert.HashAlgorithm.Algorithm)
 	if hashFunc == crypto.Hash(0) {
-		return nil, ParseError("OCSP request uses unknown hash function")
+		return nil, nil, ParseError("OCSP request uses unknown hash function")
 	}
 
 	return &Request{
@@ -444,7 +460,7 @@ func ParseRequest(bytes []byte) (*Request, error) {
 		IssuerNameHash: innerRequest.Cert.NameHash,
 		IssuerKeyHash:  innerRequest.Cert.IssuerKeyHash,
 		SerialNumber:   innerRequest.Cert.SerialNumber,
-	}, nil
+	}, req.TBSRequest.RequestExtensions, nil
 }
 
 // ParseResponse parses an OCSP response in DER form. The response must contain
@@ -529,6 +545,7 @@ func ParseResponseForCert(bytes []byte, cert, issuer *x509.Certificate) (*Respon
 		ProducedAt:         basicResp.TBSResponseData.ProducedAt,
 		ThisUpdate:         singleResp.ThisUpdate,
 		NextUpdate:         singleResp.NextUpdate,
+		ResponseExtensions: basicResp.TBSResponseData.ResponseExtensions,
 	}
 
 	// Handle the ResponderID CHOICE tag. ResponderID can be flattened into
@@ -613,6 +630,9 @@ type RequestOptions struct {
 	// Hash contains the hash function that should be used when
 	// constructing the OCSP request. If zero, SHA-1 will be used.
 	Hash crypto.Hash
+
+	// Extensions contains additional extensions sent in the request
+	Extensions []pkix.Extension
 }
 
 func (opts *RequestOptions) hash() crypto.Hash {
@@ -621,6 +641,13 @@ func (opts *RequestOptions) hash() crypto.Hash {
 		return crypto.SHA1
 	}
 	return opts.Hash
+}
+
+func (opts *RequestOptions) extensions() []pkix.Extension {
+	if opts == nil || opts.Extensions == nil {
+		return nil
+	}
+	return opts.Extensions
 }
 
 // CreateRequest returns a DER-encoded, OCSP request for the status of cert. If
@@ -661,6 +688,7 @@ func CreateRequest(cert, issuer *x509.Certificate, opts *RequestOptions) ([]byte
 		IssuerNameHash: issuerNameHash,
 		IssuerKeyHash:  issuerKeyHash,
 		SerialNumber:   cert.SerialNumber,
+		Extensions:     opts.Extensions,
 	}
 	return req.Marshal()
 }
@@ -741,10 +769,11 @@ func CreateResponse(issuer, responderCert *x509.Certificate, template Response, 
 		Bytes:      responderCert.RawSubject,
 	}
 	tbsResponseData := responseData{
-		Version:        0,
-		RawResponderID: rawResponderID,
-		ProducedAt:     time.Now().Truncate(time.Minute).UTC(),
-		Responses:      []singleResponse{innerResponse},
+		Version:            0,
+		RawResponderID:     rawResponderID,
+		ProducedAt:         time.Now().Truncate(time.Minute).UTC(),
+		Responses:          []singleResponse{innerResponse},
+		ResponseExtensions: template.Extensions,
 	}
 
 	tbsResponseDataDER, err := asn1.Marshal(tbsResponseData)
