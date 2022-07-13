@@ -688,7 +688,7 @@ func CreateRequest(cert, issuer *x509.Certificate, opts *RequestOptions) ([]byte
 		IssuerNameHash: issuerNameHash,
 		IssuerKeyHash:  issuerKeyHash,
 		SerialNumber:   cert.SerialNumber,
-		Extensions:     opts.Extensions,
+		Extensions:     opts.extensions(),
 	}
 	return req.Marshal()
 }
